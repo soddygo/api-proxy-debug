@@ -1,0 +1,8 @@
+{
+  "listen": "0.0.0.0:8080",
+  "backend_url": "https://api.anthropic.com",
+  "api_key": "your-api-key-here",
+  "api_protocol": "anthropic",
+  "no_log_body": false,
+  "no_log_headers": false
+}
