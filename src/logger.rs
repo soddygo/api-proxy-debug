@@ -5,58 +5,73 @@ use std::sync::Mutex;
 
 use chrono::Local;
 
-/// 输出写入器，支持仅 stdout 或 stdout + 文件
-enum Writer {
-    StdoutOnly,
-    Dual { file: Mutex<File> },
+/// 单个日志文件写入器
+struct LogWriter {
+    file: Mutex<File>,
+    /// 是否同时输出到终端
+    print_to_stdout: bool,
 }
 
-impl Writer {
-    fn stdout_only() -> Self {
-        Self::StdoutOnly
-    }
-
-    fn dual(log_dir: &Path) -> anyhow::Result<Self> {
+impl LogWriter {
+    fn new(log_dir: &Path, prefix: &str, print_to_stdout: bool) -> anyhow::Result<Self> {
         fs::create_dir_all(log_dir)?;
         let date = Local::now().format("%Y-%m-%d");
-        let log_path = log_dir.join(format!("proxy-{date}.log"));
+        let log_path = log_dir.join(format!("{prefix}-{date}.log"));
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)?;
-        Ok(Self::Dual {
+        Ok(Self {
             file: Mutex::new(file),
+            print_to_stdout,
         })
     }
 
     fn writeln(&self, line: &str) {
-        println!("{line}");
-        if let Self::Dual { file } = self {
-            if let Ok(mut f) = file.lock() {
-                let _ = writeln!(f, "{line}");
-            }
+        if self.print_to_stdout {
+            println!("{line}");
+        }
+        if let Ok(mut f) = self.file.lock() {
+            let _ = writeln!(f, "{line}");
         }
     }
 }
 
-/// 请求/响应日志格式化输出
-pub struct RequestLogger {
-    log_body: bool,
+/// 双日志输出器
+pub struct DualLogger {
+    /// 详细日志 (包含 headers/body，仅写文件)
+    detail: LogWriter,
+    /// 时间线日志 (仅关键事件，输出到终端+文件)
+    timeline: LogWriter,
+    /// 是否记录 headers
     log_headers: bool,
-    writer: Writer,
+    /// 是否记录 body
+    log_body: bool,
 }
 
-impl RequestLogger {
-    pub fn new(log_body: bool, log_headers: bool, log_dir: Option<&Path>) -> anyhow::Result<Self> {
-        let writer = match log_dir {
-            Some(dir) => Writer::dual(dir)?,
-            None => Writer::stdout_only(),
-        };
+impl DualLogger {
+    /// 创建双日志输出器
+    pub fn new(log_body: bool, log_headers: bool, log_dir: &Path) -> anyhow::Result<Self> {
+        // 详细日志：仅写文件，不输出到终端
+        let detail = LogWriter::new(log_dir, "proxy-detail", false)?;
+        // 时间线日志：输出到终端 + 文件
+        let timeline = LogWriter::new(log_dir, "proxy-timeline", true)?;
         Ok(Self {
-            log_body,
+            detail,
+            timeline,
             log_headers,
-            writer,
+            log_body,
         })
+    }
+
+    /// 输出到详细日志 (仅写文件)
+    fn log_detail(&self, line: &str) {
+        self.detail.writeln(line);
+    }
+
+    /// 输出到时间线日志 (终端 + 文件)
+    fn log_timeline(&self, line: &str) {
+        self.timeline.writeln(line);
     }
 
     /// 打印请求头信息 (每个请求都会调用)
@@ -66,22 +81,28 @@ impl RequestLogger {
         uri: &str,
         headers: &[(String, String)],
     ) {
-        let now = Local::now().format("%H:%M:%S%.3f");
-        self.writer.writeln(&format!("\n{}", "═".repeat(80)));
-        self.writer
-            .writeln(&format!("  REQUEST  [{now}]  {method} {uri}"));
-        self.writer.writeln(&format!("{}", "═".repeat(80)));
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let header_line = format!("  REQUEST  [{now}]  {method} {uri}");
+
+        // 时间线日志：仅关键事件
+        self.log_timeline(&format!("\n{}", "═".repeat(60)));
+        self.log_timeline(&header_line);
+        self.log_timeline(&format!("{}", "═".repeat(60)));
+
+        // 详细日志：完整内容
+        self.log_detail(&format!("\n{}", "═".repeat(80)));
+        self.log_detail(&header_line);
+        self.log_detail(&format!("{}", "═".repeat(80)));
 
         if self.log_headers && !headers.is_empty() {
-            self.writer.writeln("  Headers:");
+            self.log_detail("  Headers:");
             for (name, value) in headers {
                 let display_value = if is_sensitive_header(name) {
                     mask_sensitive(value)
                 } else {
                     value.clone()
                 };
-                self.writer
-                    .writeln(&format!("    {name}: {display_value}"));
+                self.log_detail(&format!("    {name}: {display_value}"));
             }
         }
     }
@@ -93,43 +114,47 @@ impl RequestLogger {
         }
         if let Ok(text) = std::str::from_utf8(body) {
             if !text.is_empty() {
-                self.writer.writeln("  Body:");
-                // 尝试美化 JSON
+                self.log_detail("  Body:");
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
                     if let Ok(pretty) = serde_json::to_string_pretty(&json) {
                         for line in pretty.lines() {
-                            self.writer.writeln(&format!("    {line}"));
+                            self.log_detail(&format!("    {line}"));
                         }
                     } else {
-                        self.writer.writeln(&format!("    {text}"));
+                        self.log_detail(&format!("    {text}"));
                     }
                 } else {
-                    self.writer.writeln(&format!("    {text}"));
+                    self.log_detail(&format!("    {text}"));
                 }
             }
         } else {
-            self.writer
-                .writeln(&format!("  Body: <binary {} bytes>", body.len()));
+            self.log_detail(&format!("  Body: <binary {} bytes>", body.len()));
         }
     }
 
     /// 打印响应头信息
     pub fn log_response_start(&self, status: u16, headers: &[(String, String)]) {
-        let now = Local::now().format("%H:%M:%S%.3f");
-        self.writer.writeln(&format!("\n{}", "─".repeat(80)));
-        self.writer
-            .writeln(&format!("  RESPONSE  [{now}]  Status: {status}"));
-        self.writer.writeln(&format!("{}", "─".repeat(80)));
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let header_line = format!("  RESPONSE  [{now}]  Status: {status}");
+
+        // 时间线日志
+        self.log_timeline(&format!("{}", "─".repeat(60)));
+        self.log_timeline(&header_line);
+
+        // 详细日志
+        self.log_detail(&format!("\n{}", "─".repeat(80)));
+        self.log_detail(&header_line);
+        self.log_detail(&format!("{}", "─".repeat(80)));
 
         if self.log_headers && !headers.is_empty() {
-            self.writer.writeln("  Headers:");
+            self.log_detail("  Headers:");
             for (name, value) in headers {
-                self.writer.writeln(&format!("    {name}: {value}"));
+                self.log_detail(&format!("    {name}: {value}"));
             }
         }
 
         if self.log_body {
-            self.writer.writeln("  Body (streaming):");
+            self.log_detail("  Body (streaming):");
         }
     }
 
@@ -142,7 +167,7 @@ impl RequestLogger {
             if !text.is_empty() {
                 for line in text.lines() {
                     if !line.is_empty() {
-                        self.writer.writeln(&format!("    {line}"));
+                        self.log_detail(&format!("    {line}"));
                     }
                 }
             }
@@ -151,10 +176,17 @@ impl RequestLogger {
 
     /// 打印请求结束标记
     pub fn log_request_end(&self, duration_ms: u64) {
-        self.writer.writeln(&format!("{}", "─".repeat(80)));
-        self.writer
-            .writeln(&format!("  DONE  耗时: {duration_ms}ms"));
-        self.writer.writeln(&format!("{}\n", "═".repeat(80)));
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let done_line = format!("  DONE  [{now}]  耗时: {duration_ms}ms");
+
+        // 时间线日志
+        self.log_timeline(&done_line);
+        self.log_timeline(&format!("{}\n", "═".repeat(60)));
+
+        // 详细日志
+        self.log_detail(&format!("{}", "─".repeat(80)));
+        self.log_detail(&done_line);
+        self.log_detail(&format!("{}\n", "═".repeat(80)));
     }
 
     /// 打印实际发往上游的请求 (URI 重写 + Header 注入后)
@@ -164,28 +196,41 @@ impl RequestLogger {
         uri: &str,
         headers: &[(String, String)],
     ) {
-        self.writer.writeln(&format!("  UPSTREAM  {method} {uri}"));
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let header_line = format!("  UPSTREAM  [{now}]  {method} {uri}");
+
+        // 时间线日志
+        self.log_timeline(&header_line);
+
+        // 详细日志
+        self.log_detail(&header_line);
         if self.log_headers && !headers.is_empty() {
-            self.writer.writeln("  Upstream Headers:");
+            self.log_detail("  Upstream Headers:");
             for (name, value) in headers {
                 let display_value = if is_sensitive_header(name) {
                     mask_sensitive(value)
                 } else {
                     value.clone()
                 };
-                self.writer
-                    .writeln(&format!("    {name}: {display_value}"));
+                self.log_detail(&format!("    {name}: {display_value}"));
             }
         }
     }
 
     /// 打印错误信息
     pub fn log_error(&self, message: &str) {
-        let now = Local::now().format("%H:%M:%S%.3f");
-        self.writer.writeln(&format!("\n{}", "!".repeat(80)));
-        self.writer
-            .writeln(&format!("  ERROR  [{now}]  {message}"));
-        self.writer.writeln(&format!("{}\n", "!".repeat(80)));
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let error_line = format!("  ERROR  [{now}]  {message}");
+
+        // 时间线日志
+        self.log_timeline(&format!("\n{}", "!".repeat(60)));
+        self.log_timeline(&error_line);
+        self.log_timeline(&format!("{}\n", "!".repeat(60)));
+
+        // 详细日志
+        self.log_detail(&format!("\n{}", "!".repeat(80)));
+        self.log_detail(&error_line);
+        self.log_detail(&format!("{}\n", "!".repeat(80)));
     }
 
     /// 打印上游连接信息
@@ -197,9 +242,16 @@ impl RequestLogger {
         reused: bool,
         tls_version: &str,
     ) {
-        self.writer.writeln(&format!(
-            "  CONNECT  {sni} -> {address} (TLS={use_tls}, reused={reused}, tls_version={tls_version})"
-        ));
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let conn_line = format!(
+            "  CONNECT  [{now}]  {sni} -> {address} (TLS={use_tls}, reused={reused}, tls_version={tls_version})"
+        );
+
+        // 时间线日志
+        self.log_timeline(&conn_line);
+
+        // 详细日志
+        self.log_detail(&conn_line);
     }
 }
 

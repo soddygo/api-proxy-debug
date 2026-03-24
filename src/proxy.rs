@@ -13,7 +13,7 @@ use pingora_proxy::{ProxyHttp, Session};
 use tracing::{error, info};
 
 use crate::cli::ResolvedConfig;
-use crate::logger::RequestLogger;
+use crate::logger::DualLogger;
 
 /// 后端连接信息，从 CLI 参数解析
 #[derive(Clone, Debug)]
@@ -86,7 +86,7 @@ pub struct ApiProxy {
     pub backend: BackendInfo,
     pub api_key: String,
     pub use_anthropic_auth: bool,
-    pub logger: Arc<RequestLogger>,
+    pub logger: Arc<DualLogger>,
 }
 
 #[async_trait]
@@ -395,10 +395,16 @@ impl ApiProxy {
     pub fn from_config(config: &ResolvedConfig) -> anyhow::Result<Self> {
         let backend = BackendInfo::from_url(&config.backend_url)?;
         let log_dir = config.log_dir.as_deref().map(Path::new);
-        let logger = Arc::new(
-            RequestLogger::new(config.log_body(), config.log_headers(), log_dir)
-                .map_err(|e| anyhow::anyhow!("初始化日志目录失败: {e}"))?,
-        );
+
+        let logger = match log_dir {
+            Some(dir) => Arc::new(
+                DualLogger::new(config.log_body(), config.log_headers(), dir)
+                    .map_err(|e| anyhow::anyhow!("初始化日志目录失败: {e}"))?,
+            ),
+            None => {
+                return Err(anyhow::anyhow!("log_dir 是必填项，请通过 --log-dir 或配置文件指定"));
+            }
+        };
 
         info!(
             "后端地址: {}:{} (TLS={})",
