@@ -18,6 +18,15 @@ pub struct ConfigFile {
 impl ConfigFile {
     /// 从 JSON 文件加载配置
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        // 检查配置文件是否存在
+        if !path.exists() {
+            return Err(anyhow::anyhow!(
+                "配置文件 '{}' 不存在\n\n请先创建配置文件，例如:\n  cp config.example.json {}\n\n或者使用命令行参数直接指定配置:\n  cargo run -- --backend-url https://api.example.com --api-key your-key",
+                path.display(),
+                path.display()
+            ));
+        }
+
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("读取配置文件 {} 失败: {e}", path.display()))?;
         let config: Self = serde_json::from_str(&content)
@@ -88,7 +97,9 @@ impl ResolvedConfig {
             .backend_url
             .clone()
             .or(file_config.backend_url)
-            .ok_or_else(|| anyhow::anyhow!("缺少 backend_url，请通过 --backend-url 或配置文件指定"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("缺少 backend_url，请通过 --backend-url 或配置文件指定")
+            })?;
 
         let api_key = args
             .api_key

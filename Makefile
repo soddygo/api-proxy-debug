@@ -8,11 +8,6 @@ build:
 	cargo build --release $(CARGO_FLAGS)
 
 run:
-	@if [ ! -f $(CONFIG_FILE) ]; then \
-		echo "错误: 配置文件 $(CONFIG_FILE) 不存在"; \
-		echo "请先复制示例配置: cp config.example.json config.json"; \
-		exit 1; \
-	fi
 	cargo run --release $(CARGO_FLAGS) -- --config $(CONFIG_FILE) --log-dir $(LOG_DIR)
 
 clean:
