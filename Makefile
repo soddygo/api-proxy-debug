@@ -2,13 +2,23 @@ CONFIG_FILE ?= config.json
 CARGO_FLAGS ?=
 LOG_DIR ?= logs
 
+# 检测 Windows 环境
+IS_WINDOWS := $(findstring MINGW,$(shell uname -s))$(findstring MSYS,$(shell uname -s))
+ifeq ($(IS_WINDOWS),)
+# 非 Windows (macOS/Linux)
+CMAKE_ENV :=
+else
+# Windows 环境
+CMAKE_ENV := CMAKE_GENERATOR=Visual Studio 17 2022
+endif
+
 .PHONY: build run clean help
 
 build:
-	cargo build --release $(CARGO_FLAGS)
+	$(CMAKE_ENV) cargo build --release $(CARGO_FLAGS)
 
 run:
-	cargo run --release $(CARGO_FLAGS) -- --config $(CONFIG_FILE) --log-dir $(LOG_DIR)
+	$(CMAKE_ENV) cargo run --release $(CARGO_FLAGS) -- --config $(CONFIG_FILE) --log-dir $(LOG_DIR)
 
 clean:
 	cargo clean
