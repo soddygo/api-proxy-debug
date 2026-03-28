@@ -29,7 +29,13 @@ pub fn start_proxy_server(config: &ResolvedConfig) -> Result<()> {
 
     info!("代理服务器启动成功");
     info!("监听地址: {listen_addr}");
-    info!("使用方式: ANTHROPIC_BASE_URL=http://127.0.0.1:{port} claude");
+
+    let base_url_var = if config.use_anthropic_auth() {
+        "ANTHROPIC_BASE_URL"
+    } else {
+        "OPENAI_BASE_URL"
+    };
+    info!("使用方式: {base_url_var}=http://127.0.0.1:{port} <your-client>");
 
     // 阻塞运行
     server.run_forever();
