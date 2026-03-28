@@ -9,7 +9,7 @@ ifeq ($(IS_WINDOWS),)
 CMAKE_ENV :=
 else
 # Windows 环境
-CMAKE_ENV := CMAKE_GENERATOR=Visual Studio 17 2022
+CMAKE_ENV := CMAKE_GENERATOR="Visual Studio 17 2022"
 endif
 
 .PHONY: build run clean help
