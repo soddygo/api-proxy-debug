@@ -18,6 +18,7 @@ build:
 	$(CMAKE_ENV) cargo build --release $(CARGO_FLAGS)
 
 run:
+	@mkdir -p $(LOG_DIR) && rm -f $(LOG_DIR)/*.log && echo "Logs cleared"
 	$(CMAKE_ENV) cargo run --release $(CARGO_FLAGS) -- --config $(CONFIG_FILE) --log-dir $(LOG_DIR)
 
 clean:

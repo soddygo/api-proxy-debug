@@ -55,6 +55,10 @@ pub struct ProxyContext {
     pub start_time: Instant,
     /// 收集的请求 body chunks
     pub request_body: Vec<u8>,
+    /// 从请求 body 中解析出的模型名称
+    pub model: Option<String>,
+    /// 是否已打印配置信息
+    pub config_printed: bool,
 }
 
 impl ProxyContext {
@@ -62,6 +66,8 @@ impl ProxyContext {
         Self {
             start_time: Instant::now(),
             request_body: Vec::new(),
+            model: None,
+            config_printed: false,
         }
     }
 }
@@ -246,6 +252,45 @@ impl ProxyHttp for ApiProxy {
         // body 收集完毕，打印 body 日志
         if end_of_stream && !ctx.request_body.is_empty() {
             self.logger.log_request_body(&ctx.request_body);
+
+            // 解析 body 中的模型名称
+            if ctx.model.is_none() {
+                if let Ok(text) = std::str::from_utf8(&ctx.request_body) {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+                        if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
+                            ctx.model = Some(model.to_string());
+                        }
+                    }
+                }
+            }
+
+            // 打印配置信息（只打印请求中的模型，不打印用户配置的模型）
+            if !ctx.config_printed {
+                let scheme = if self.backend.use_tls { "https" } else { "http" };
+                let backend_url = if self.backend.base_path.is_empty() {
+                    format!("{}://{}:{}", scheme, self.backend.host, self.backend.port)
+                } else {
+                    format!(
+                        "{}://{}:{}{}",
+                        scheme,
+                        self.backend.host,
+                        self.backend.port,
+                        self.backend.base_path
+                    )
+                };
+                let auth_type = if self.use_anthropic_auth {
+                    "x-api-key"
+                } else {
+                    "Bearer"
+                };
+                self.logger.log_config(
+                    &backend_url,
+                    ctx.model.as_deref(),
+                    auth_type,
+                    &self.api_key,
+                );
+                ctx.config_printed = true;
+            }
         }
 
         Ok(())

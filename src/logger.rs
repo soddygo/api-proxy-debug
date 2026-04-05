@@ -253,6 +253,37 @@ impl DualLogger {
         // 详细日志
         self.log_detail(&conn_line);
     }
+
+    /// 打印代理配置信息 (Backend URL、模型、认证方式、API Key)
+    pub fn log_config(
+        &self,
+        backend_url: &str,
+        model: Option<&str>,
+        auth_type: &str,
+        api_key: &str,
+    ) {
+        let now = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+
+        // 构建配置信息字符串
+        let model_str = match model {
+            Some(m) => format!("  Model: {}", m),
+            None => "  Model: <not set>".to_string(),
+        };
+
+        let config_line = format!(
+            "  CONFIG   [{now}]  Backend: {}  {}  Auth: {}  API-Key: {}",
+            backend_url,
+            model_str,
+            auth_type,
+            mask_sensitive(api_key)
+        );
+
+        // 时间线日志
+        self.log_timeline(&config_line);
+
+        // 详细日志
+        self.log_detail(&config_line);
+    }
 }
 
 /// 判断是否为敏感 header
