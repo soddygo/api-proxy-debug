@@ -1,3 +1,7 @@
+//! 服务器启动模块
+
+use std::sync::Arc;
+
 use anyhow::Result;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::Opt;
@@ -5,11 +9,12 @@ use tracing::info;
 
 use crate::cli::ResolvedConfig;
 use crate::proxy::ApiProxy;
+use crate::stats::RequestStats;
 
 /// 启动 Pingora 代理服务器
-pub fn start_proxy_server(config: &ResolvedConfig) -> Result<()> {
+pub fn start_proxy_server(config: &ResolvedConfig, stats: Option<Arc<RequestStats>>) -> Result<()> {
     // 创建代理服务
-    let proxy = ApiProxy::from_config(config)?;
+    let proxy = ApiProxy::from_config(config, stats)?;
     let (_, port) = config.listen_addr();
 
     // 创建 Pingora 服务器
@@ -29,13 +34,16 @@ pub fn start_proxy_server(config: &ResolvedConfig) -> Result<()> {
 
     info!("代理服务器启动成功");
     info!("监听地址: {listen_addr}");
-
-    let base_url_var = if config.use_anthropic_auth() {
-        "ANTHROPIC_BASE_URL"
-    } else {
-        "OPENAI_BASE_URL"
-    };
-    info!("使用方式: {base_url_var}=http://127.0.0.1:{port} <your-client>");
+    info!("");
+    info!("使用方式:");
+    info!("  ANTHROPIC_BASE_URL=http://127.0.0.1:{port} <your-client>");
+    info!("  OPENAI_BASE_URL=http://127.0.0.1:{port} <your-client>");
+    info!("");
+    info!("多后端路由:");
+    for backend in &config.backends {
+        let prefix = backend.match_rules.path_prefix.as_deref().unwrap_or("/");
+        info!("  {} -> {} ({})", prefix, backend.name, backend.url);
+    }
 
     // 阻塞运行
     server.run_forever();

@@ -1,4 +1,7 @@
-use std::path::Path;
+//! 代理核心模块
+//!
+//! 实现 Pingora ProxyHttp trait，处理请求转发、日志记录、统计等
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,44 +13,12 @@ use pingora_core::protocols::TcpKeepalive;
 use pingora_core::upstreams::peer::{ALPN, HttpPeer, Peer};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
+use crate::backend::{BackendInfo, BackendRouter};
 use crate::cli::ResolvedConfig;
-use crate::logger::DualLogger;
-
-/// 后端连接信息，从 CLI 参数解析
-#[derive(Clone, Debug)]
-pub struct BackendInfo {
-    pub host: String,
-    pub port: u16,
-    pub use_tls: bool,
-    pub base_path: String,
-}
-
-impl BackendInfo {
-    /// 从 backend_url 解析出连接信息
-    pub fn from_url(backend_url: &str) -> anyhow::Result<Self> {
-        let parsed = url::Url::parse(backend_url)
-            .map_err(|e| anyhow::anyhow!("无效的 backend-url: {e}"))?;
-
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("backend-url 缺少 host"))?
-            .to_string();
-
-        let use_tls = parsed.scheme() == "https";
-        let port = parsed.port().unwrap_or(if use_tls { 443 } else { 80 });
-
-        let base_path = parsed.path().trim_end_matches('/').to_string();
-
-        Ok(Self {
-            host,
-            port,
-            use_tls,
-            base_path,
-        })
-    }
-}
+use crate::logger::RequestLogger;
+use crate::stats::{RequestRecord, RequestStats, TokenUsage};
 
 /// 每个请求的上下文
 pub struct ProxyContext {
@@ -57,8 +28,18 @@ pub struct ProxyContext {
     pub request_body: Vec<u8>,
     /// 从请求 body 中解析出的模型名称
     pub model: Option<String>,
-    /// 是否已打印配置信息
-    pub config_printed: bool,
+    /// 选中的后端
+    pub selected_backend: Option<BackendInfo>,
+    /// 重写后的路径
+    pub rewritten_path: Option<String>,
+    /// 请求日志记录器
+    pub logger: Option<RequestLogger>,
+    /// 收集的响应 body（用于解析 Token）
+    pub response_body: Vec<u8>,
+    /// Token 使用量
+    pub token_usage: Option<TokenUsage>,
+    /// 响应状态码
+    pub status: u16,
 }
 
 impl ProxyContext {
@@ -67,7 +48,12 @@ impl ProxyContext {
             start_time: Instant::now(),
             request_body: Vec::new(),
             model: None,
-            config_printed: false,
+            selected_backend: None,
+            rewritten_path: None,
+            logger: None,
+            response_body: Vec::new(),
+            token_usage: None,
+            status: 0,
         }
     }
 }
@@ -89,10 +75,8 @@ fn collect_request_headers(session: &Session) -> Vec<(String, String)> {
 
 /// API 代理服务 - 实现 Pingora ProxyHttp trait
 pub struct ApiProxy {
-    pub backend: BackendInfo,
-    pub api_key: String,
-    pub use_anthropic_auth: bool,
-    pub logger: Arc<DualLogger>,
+    pub router: Arc<BackendRouter>,
+    pub stats: Option<Arc<RequestStats>>,
 }
 
 #[async_trait]
@@ -103,20 +87,36 @@ impl ProxyHttp for ApiProxy {
         ProxyContext::new()
     }
 
-    /// 请求过滤 - 每个请求都会触发，用于记录请求头
+    /// 请求过滤 - 每个请求都会触发
     async fn request_filter(
         &self,
         session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> PingoraResult<bool>
     where
         Self::CTX: Send + Sync,
     {
         let method = session.req_header().method.as_str().to_string();
         let uri = session.req_header().uri.to_string();
+        let path = session.req_header().uri.path().to_string();
         let headers = collect_request_headers(session);
 
-        self.logger.log_request_header(&method, &uri, &headers);
+        // 选择后端
+        let (backend, rewritten_path) = match self.router.select_and_rewrite(&path, &headers) {
+            Some(result) => result,
+            None => {
+                warn!("没有匹配的后端: {}", path);
+                return Err(pingora_core::Error::new_str("No matching backend"));
+            }
+        };
+
+        ctx.selected_backend = Some(backend.clone());
+        ctx.rewritten_path = Some(rewritten_path);
+
+        // 创建请求日志记录器
+        let mut logger = RequestLogger::new(&method, &uri, &backend.name);
+        logger.log_request_headers(&headers);
+        ctx.logger = Some(logger);
 
         // 返回 false 表示继续处理
         Ok(false)
@@ -126,18 +126,21 @@ impl ProxyHttp for ApiProxy {
     async fn upstream_peer(
         &self,
         _session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> PingoraResult<Box<HttpPeer>> {
+        let backend = ctx.selected_backend.as_ref()
+            .ok_or_else(|| pingora_core::Error::new_str("No backend selected"))?;
+
         let mut peer = HttpPeer::new(
-            (self.backend.host.as_str(), self.backend.port),
-            self.backend.use_tls,
-            self.backend.host.clone(),
+            (backend.host.as_str(), backend.port),
+            backend.use_tls,
+            backend.host.clone(),
         );
 
-        // HTTP/2 优先，回退到 HTTP/1.1
+        // HTTP/2 优先
         peer.options.alpn = ALPN::H2H1;
 
-        // 连接超时和 keepalive 设置
+        // 连接配置
         peer.options.connection_timeout = Some(Duration::from_secs(10));
         peer.options.total_connection_timeout = Some(Duration::from_secs(30));
         peer.options.idle_timeout = Some(Duration::from_secs(90));
@@ -147,7 +150,7 @@ impl ProxyHttp for ApiProxy {
             count: 5,
         });
 
-        if self.backend.use_tls {
+        if backend.use_tls {
             peer.options.h2_ping_interval = Some(Duration::from_secs(30));
         }
 
@@ -159,61 +162,59 @@ impl ProxyHttp for ApiProxy {
         &self,
         session: &mut Session,
         upstream_request: &mut RequestHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
+        let backend = ctx.selected_backend.as_ref()
+            .ok_or_else(|| pingora_core::Error::new_str("No backend selected"))?;
+        let rewritten_path = ctx.rewritten_path.as_ref()
+            .ok_or_else(|| pingora_core::Error::new_str("No rewritten path"))?;
+
         let original_uri = session.req_header().uri.clone();
-        let original_path = original_uri.path();
         let query = original_uri.query();
 
-        // 1. 重写 URI: 拼接 base_path + 原始路径
-        let new_path = if self.backend.base_path.is_empty() {
-            original_path.to_string()
-        } else {
-            format!("{}{}", self.backend.base_path, original_path)
-        };
-
+        // 构建新的 URI
         let new_uri_str = if let Some(q) = query {
-            format!("{new_path}?{q}")
+            format!("{}?{}", rewritten_path, q)
         } else {
-            new_path
+            rewritten_path.clone()
         };
 
         let new_uri: http::Uri = new_uri_str.parse().map_err(|e| {
-            error!("URI 重写失败: {e}");
+            error!("URI 重写失败: {}", e);
             pingora_core::Error::new_str("URI rewrite failed")
         })?;
         upstream_request.set_uri(new_uri);
 
-        // 2. 移除客户端的认证头
+        // 移除客户端的认证头
         upstream_request.remove_header("x-api-key");
         upstream_request.remove_header("authorization");
 
-        // 3. 注入真实 API Key
-        if self.use_anthropic_auth {
+        // 注入 API Key
+        if backend.use_anthropic_auth() {
             upstream_request
-                .insert_header("x-api-key", &self.api_key)
+                .insert_header("x-api-key", &backend.api_key)
                 .map_err(|e| {
-                    error!("注入 x-api-key 失败: {e}");
+                    error!("注入 x-api-key 失败: {}", e);
                     pingora_core::Error::new_str("Header injection failed")
                 })?;
         } else {
             upstream_request
-                .insert_header("authorization", &format!("Bearer {}", self.api_key))
+                .insert_header("authorization", &format!("Bearer {}", backend.api_key))
                 .map_err(|e| {
-                    error!("注入 authorization 失败: {e}");
+                    error!("注入 authorization 失败: {}", e);
                     pingora_core::Error::new_str("Header injection failed")
                 })?;
         }
 
-        // 4. 设置 Host 头
+        // 设置 Host 头
         upstream_request
-            .insert_header("host", &self.backend.host)
+            .insert_header("host", &backend.host)
             .map_err(|e| {
-                error!("设置 Host 头失败: {e}");
+                error!("设置 Host 头失败: {}", e);
                 pingora_core::Error::new_str("Host header failed")
             })?;
 
-        // 5. 记录实际发往上游的请求 (URI 重写 + API Key 注入后)
+        // 记录上游请求
         let upstream_headers: Vec<(String, String)> = upstream_request
             .headers
             .iter()
@@ -224,16 +225,19 @@ impl ProxyHttp for ApiProxy {
                 )
             })
             .collect();
-        self.logger.log_upstream_request(
-            upstream_request.method.as_str(),
-            &upstream_request.uri.to_string(),
-            &upstream_headers,
-        );
+
+        if let Some(ref logger) = ctx.logger {
+            logger.log_upstream_request(
+                upstream_request.method.as_str(),
+                &upstream_request.uri.to_string(),
+                &upstream_headers,
+            );
+        }
 
         Ok(())
     }
 
-    /// 捕获请求 body (仅有 body 的请求会触发)
+    /// 捕获请求 body
     async fn request_body_filter(
         &self,
         _session: &mut Session,
@@ -244,16 +248,20 @@ impl ProxyHttp for ApiProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // 收集 body chunks
+        // 收集 body 到 context
         if let Some(b) = body {
             ctx.request_body.extend_from_slice(b);
         }
 
-        // body 收集完毕，打印 body 日志
+        // body 收集完毕
         if end_of_stream && !ctx.request_body.is_empty() {
-            self.logger.log_request_body(&ctx.request_body);
+            // 先将 body 传递给 logger
+            if let Some(ref mut logger) = ctx.logger {
+                logger.collect_body(&ctx.request_body);
+                logger.log_request_body();
+            }
 
-            // 解析 body 中的模型名称
+            // 解析模型名称
             if ctx.model.is_none() {
                 if let Ok(text) = std::str::from_utf8(&ctx.request_body) {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
@@ -262,34 +270,6 @@ impl ProxyHttp for ApiProxy {
                         }
                     }
                 }
-            }
-
-            // 打印配置信息（只打印请求中的模型，不打印用户配置的模型）
-            if !ctx.config_printed {
-                let scheme = if self.backend.use_tls { "https" } else { "http" };
-                let backend_url = if self.backend.base_path.is_empty() {
-                    format!("{}://{}:{}", scheme, self.backend.host, self.backend.port)
-                } else {
-                    format!(
-                        "{}://{}:{}{}",
-                        scheme,
-                        self.backend.host,
-                        self.backend.port,
-                        self.backend.base_path
-                    )
-                };
-                let auth_type = if self.use_anthropic_auth {
-                    "x-api-key"
-                } else {
-                    "Bearer"
-                };
-                self.logger.log_config(
-                    &backend_url,
-                    ctx.model.as_deref(),
-                    auth_type,
-                    &self.api_key,
-                );
-                ctx.config_printed = true;
             }
         }
 
@@ -301,11 +281,11 @@ impl ProxyHttp for ApiProxy {
         &self,
         _session: &mut Session,
         upstream_response: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
         let status = upstream_response.status.as_u16();
+        ctx.status = status;
 
-        // 收集响应 headers
         let headers: Vec<(String, String)> = upstream_response
             .headers
             .iter()
@@ -317,7 +297,9 @@ impl ProxyHttp for ApiProxy {
             })
             .collect();
 
-        self.logger.log_response_start(status, &headers);
+        if let Some(ref logger) = ctx.logger {
+            logger.log_response_start(status, &headers);
+        }
 
         Ok(())
     }
@@ -333,15 +315,49 @@ impl ProxyHttp for ApiProxy {
     where
         Self::CTX: Send + Sync,
     {
-        // 逐 chunk 打印响应 body
+        // 记录响应 chunk
         if let Some(b) = body {
-            self.logger.log_response_chunk(b);
+            if let Some(ref logger) = ctx.logger {
+                logger.log_response_chunk(b);
+            }
+
+            // 收集响应用于解析 Token
+            ctx.response_body.extend_from_slice(b);
+
+            // 尝试解析 Token 使用量
+            if let Ok(text) = std::str::from_utf8(b) {
+                if let Some(usage) = TokenUsage::parse_from_sse(text) {
+                    ctx.token_usage = Some(usage);
+                }
+            }
         }
 
-        // 响应结束，打印耗时
+        // 响应结束
         if end_of_body {
-            let duration = ctx.start_time.elapsed().as_millis() as u64;
-            self.logger.log_request_end(duration);
+            let duration_ms = ctx.start_time.elapsed().as_millis() as u64;
+
+            if let Some(ref logger) = ctx.logger {
+                logger.log_request_end(duration_ms, ctx.status);
+            }
+
+            // 记录统计
+            if let Some(ref stats) = self.stats {
+                let usage = ctx.token_usage.as_ref();
+                stats.record_request(RequestRecord {
+                    timestamp: chrono::Utc::now(),
+                    method: "POST".to_string(),
+                    uri: String::new(),
+                    backend: ctx.selected_backend.as_ref().map(|b| b.name.clone()).unwrap_or_default(),
+                    model: ctx.model.clone(),
+                    status: ctx.status,
+                    duration_ms,
+                    input_tokens: usage.map(|u| u.input_tokens),
+                    output_tokens: usage.map(|u| u.output_tokens),
+                    cache_read_tokens: usage.map(|u| u.cache_read_tokens),
+                    cache_creation_tokens: usage.map(|u| u.cache_creation_tokens),
+                    error: None,
+                });
+            }
         }
 
         Ok(None)
@@ -356,20 +372,25 @@ impl ProxyHttp for ApiProxy {
         #[cfg(unix)] _fd: std::os::unix::io::RawFd,
         #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
         digest: Option<&Digest>,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> PingoraResult<()> {
         let tls_version = digest
             .and_then(|d| d.ssl_digest.as_ref())
             .map(|ssl| ssl.version.to_string())
             .unwrap_or_else(|| "none".to_string());
 
-        self.logger.log_connection(
-            &peer.sni().to_string(),
-            &peer.address().to_string(),
-            self.backend.use_tls,
-            reused,
-            &tls_version,
-        );
+        let backend = ctx.selected_backend.as_ref();
+        let use_tls = backend.map(|b| b.use_tls).unwrap_or(false);
+
+        if let Some(ref logger) = ctx.logger {
+            logger.log_connection(
+                &peer.sni().to_string(),
+                &peer.address().to_string(),
+                use_tls,
+                reused,
+                &tls_version,
+            );
+        }
 
         Ok(())
     }
@@ -380,14 +401,31 @@ impl ProxyHttp for ApiProxy {
         peer: &HttpPeer,
         session: &mut Session,
         e: Box<pingora_core::Error>,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
         client_reused: bool,
     ) -> Box<pingora_core::Error> {
-        self.logger.log_error(&format!(
-            "代理错误 [{}]: {}",
-            peer.address(),
-            e
-        ));
+        if let Some(ref logger) = ctx.logger {
+            logger.log_error(&format!("代理错误 [{}]: {}", peer.address(), e));
+        }
+
+        // 记录错误统计
+        if let Some(ref stats) = self.stats {
+            stats.record_request(RequestRecord {
+                timestamp: chrono::Utc::now(),
+                method: session.req_header().method.as_str().to_string(),
+                uri: session.req_header().uri.to_string(),
+                backend: ctx.selected_backend.as_ref().map(|b| b.name.clone()).unwrap_or_default(),
+                model: ctx.model.clone(),
+                status: 502,
+                duration_ms: ctx.start_time.elapsed().as_millis() as u64,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                error: Some(e.to_string()),
+            });
+        }
+
         let mut e = e.more_context(format!("Peer: {}", peer));
         e.retry
             .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
@@ -399,7 +437,7 @@ impl ProxyHttp for ApiProxy {
         &self,
         session: &mut Session,
         e: &pingora_core::Error,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> pingora_proxy::FailToProxy
     where
         Self::CTX: Send + Sync,
@@ -413,12 +451,13 @@ impl ProxyHttp for ApiProxy {
 
         let method = session.req_header().method.as_str();
         let uri = &session.req_header().uri;
-        self.logger.log_error(&format!(
-            "请求失败 [{method} {uri}] -> {code}: {e}"
-        ));
 
-        // 尝试向下游写入错误响应
-        let body = format!("{{\"error\": \"{e}\"}}");
+        if let Some(ref logger) = ctx.logger {
+            logger.log_error(&format!("请求失败 [{} {}] -> {}: {}", method, uri, code, e));
+        }
+
+        // 返回错误响应
+        let body = format!(r#"{{"error": "{}"}}"#, e);
         if let Ok(mut resp) = pingora_http::ResponseHeader::build(code, None) {
             let _ = resp.insert_header("content-type", "application/json");
             let _ = resp.insert_header("content-length", &body.len().to_string());
@@ -436,40 +475,13 @@ impl ProxyHttp for ApiProxy {
 }
 
 impl ApiProxy {
-    /// 从合并后的配置创建代理服务
-    pub fn from_config(config: &ResolvedConfig) -> anyhow::Result<Self> {
-        let backend = BackendInfo::from_url(&config.backend_url)?;
-        let log_dir = config.log_dir.as_deref().map(Path::new);
+    /// 从配置创建代理服务
+    pub fn from_config(config: &ResolvedConfig, stats: Option<Arc<RequestStats>>) -> anyhow::Result<Self> {
+        let router = Arc::new(BackendRouter::new(config.backends.clone())?);
 
-        let logger = match log_dir {
-            Some(dir) => Arc::new(
-                DualLogger::new(config.log_body(), config.log_headers(), dir)
-                    .map_err(|e| anyhow::anyhow!("初始化日志目录失败: {e}"))?,
-            ),
-            None => {
-                return Err(anyhow::anyhow!("log_dir 是必填项，请通过 --log-dir 或配置文件指定"));
-            }
-        };
+        info!("代理服务创建成功");
+        info!("后端列表: {:?}", router.backend_names());
 
-        info!(
-            "后端地址: {}:{} (TLS={})",
-            backend.host, backend.port, backend.use_tls
-        );
-        info!("后端路径前缀: {}", backend.base_path);
-        info!(
-            "认证方式: {}",
-            if config.use_anthropic_auth() {
-                "Anthropic (x-api-key)"
-            } else {
-                "OpenAI (Authorization: Bearer)"
-            }
-        );
-
-        Ok(Self {
-            backend,
-            api_key: config.api_key.clone(),
-            use_anthropic_auth: config.use_anthropic_auth(),
-            logger,
-        })
+        Ok(Self { router, stats })
     }
 }

@@ -1,8 +1,56 @@
 {
-  "listen": "0.0.0.0:8080",
-  "backend_url": "https://api.anthropic.com",
-  "api_key": "your-api-key-here",
-  "api_protocol": "anthropic",
-  "no_log_body": false,
-  "no_log_headers": false
+  "listen": "0.0.0.0:8989",
+  "log_dir": "logs",
+
+  "backends": [
+    {
+      "name": "anthropic",
+      "url": "https://api.anthropic.com",
+      "api_key": "sk-ant-your-api-key",
+      "protocol": "anthropic",
+      "match_rules": {
+        "path_prefix": "/anthropic"
+      }
+    },
+    {
+      "name": "openai",
+      "url": "https://api.openai.com/v1",
+      "api_key": "sk-your-api-key",
+      "protocol": "openai",
+      "match_rules": {
+        "path_prefix": "/openai"
+      }
+    },
+    {
+      "name": "zhipu",
+      "url": "https://open.bigmodel.cn/api/paas/v4",
+      "api_key": "your-zhipu-api-key",
+      "protocol": "openai",
+      "match_rules": {
+        "path_prefix": "/zhipu"
+      }
+    },
+    {
+      "name": "default",
+      "url": "https://open.bigmodel.cn/api/anthropic",
+      "api_key": "your-api-key",
+      "protocol": "anthropic",
+      "match_rules": {
+        "default": true
+      }
+    }
+  ],
+
+  "stats": {
+    "enabled": true,
+    "max_recent": 1000
+  },
+
+  "telemetry": {
+    "enabled": false,
+    "otlp_endpoint": "http://localhost:4317",
+    "service_name": "api-proxy-debug",
+    "sample_rate": 1.0,
+    "enable_metrics": true
+  }
 }
