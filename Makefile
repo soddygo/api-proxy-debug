@@ -31,8 +31,7 @@ stats:
 	@cat $(LOG_DIR)/stats.json 2>/dev/null || echo "暂无统计数据，请先运行代理"
 
 clean:
-	cargo clean
-	rm -rf $(LOG_DIR)/*.log
+	rm -rf $(LOG_DIR)/*
 
 help:
 	@echo "用法:"
